@@ -1,9 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.CLI/main/qpm.schema.json",
-  "version": "5.1.0",
   "info": {
     "name": "Slice Visualizer",
     "id": "slicevisualizer",
+    "version": "5.1.0",
     "url": null,
     "additionalData": {
       "overrideSoName": "libslicevisualizer.so"
