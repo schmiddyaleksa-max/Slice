@@ -1,5 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/QuestPackageManager/QPM.CLI/main/qpm.schema.json",
+  "sharedDir": "shared",
+  "dependenciesDir": "extern",
   "info": {
     "name": "Slice Visualizer",
     "id": "slicevisualizer",
@@ -10,10 +12,6 @@
     }
   },
   "workspace": {
-    "package": {
-      "sharedDir": "shared",
-      "dependenciesDir": "extern"
-    },
     "ndk": "^25.0.0"
   },
   "dependencies": [
