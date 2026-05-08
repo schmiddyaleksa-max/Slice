@@ -1,4 +1,4 @@
-name: Build & Package QMOD
+name: Build qmod
 
 on:
   push:
@@ -9,175 +9,85 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      # ── 2. Install QPM via GitHub Releases API ───────────────────────────────
-      # We use the API to find the correct linux asset name dynamically,
-      # so this won't break when QPM renames their release assets again.
-      - name: Install QPM
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build unzip jq
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+
+      - name: Download QPM
         run: |
           RELEASE_JSON=$(curl -sL https://api.github.com/repos/QuestPackageManager/QPM.CLI/releases/latest)
-          DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '
-            .assets[]
-            | select(.name | test("linux"; "i"))
-            | select(.name | test("musl") | not)
-            | .browser_download_url
-          ')
+          QPM_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
 
-          if [ -z "$DOWNLOAD_URL" ]; then
-            echo "ERROR: Could not find a Linux QPM release asset."
-            echo "Available assets:"
-            echo "$RELEASE_JSON" | jq -r '.assets[].name'
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            QPM_BINARY="qpm-linux-x64"
+          elif [ "$ARCH" = "aarch64" ]; then
+            QPM_BINARY="qpm-linux-aarch64"
+          else
+            echo "Unsupported architecture: $ARCH"
             exit 1
           fi
 
-          echo "Downloading QPM from: $DOWNLOAD_URL"
-          curl -Lo /usr/local/bin/qpm "$DOWNLOAD_URL"
+          QPM_URL="https://github.com/QuestPackageManager/QPM.CLI/releases/download/${QPM_VERSION}/${QPM_BINARY}.zip"
+          echo "Downloading QPM from: $QPM_URL"
+          curl -sLo qpm.zip "$QPM_URL"
+          unzip -o qpm.zip -d /usr/local/bin/
           chmod +x /usr/local/bin/qpm
-          qpm --version
 
-      # ── 3. Install Ninja ─────────────────────────────────────────────────────
-      - name: Install Ninja
-        run: sudo apt-get install -y ninja-build
-
-      # ── 4. QPM Restore + NDK setup ───────────────────────────────────────────
-      # qpm restore generates: extern/, shared/, qpm_defines.cmake, extern.cmake
-      # qpm ndk resolve -d auto-downloads + configures the correct NDK version
       - name: QPM Restore
         run: qpm restore
 
-      - name: Setup NDK via QPM
-        run: qpm ndk resolve -d
+      - name: Build
+        run: |
+          export ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}
+          export NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-31 \
+            -G Ninja
+          cmake --build build --config Release
 
-      # ── 5. Read mod metadata ─────────────────────────────────────────────────
-      - name: Read mod metadata
-        id: mod
+      - name: Create qmod
         run: |
           MOD_ID=$(jq -r '.info.id' qpm.json)
           MOD_VERSION=$(jq -r '.info.version' qpm.json)
-          MOD_NAME=$(jq -r '.info.name' qpm.json)
-          echo "id=$MOD_ID"             >> $GITHUB_OUTPUT
-          echo "version=$MOD_VERSION"   >> $GITHUB_OUTPUT
-          echo "name=$MOD_NAME"         >> $GITHUB_OUTPUT
-          echo "soname=lib${MOD_ID}.so" >> $GITHUB_OUTPUT
-          echo "qmodname=${MOD_ID}_v${MOD_VERSION}.qmod" >> $GITHUB_OUTPUT
+          SO_NAME=$(jq -r '.info.additionalData.overrideSoName // "lib\($MOD_ID).so"' qpm.json)
 
-      # ── 6. Generate mod.json from template ───────────────────────────────────
-      - name: Generate mod.json
-        run: |
-          sed \
-            -e "s/\${mod_name}/${{ steps.mod.outputs.name }}/g" \
-            -e "s/\${mod_id}/${{ steps.mod.outputs.id }}/g" \
-            -e "s/\${version}/${{ steps.mod.outputs.version }}/g" \
-            mod.template.json > mod.json
-          echo "Generated mod.json:"
-          cat mod.json
+          mkdir -p qmod_package
+          cp build/lib/${SO_NAME} qmod_package/ 2>/dev/null || cp build/${SO_NAME} qmod_package/ || true
 
-      # ── 7. CMake configure ───────────────────────────────────────────────────
-      # QPM sets ANDROID_NDK_HOME after `ndk resolve -d`, so we source it here.
-      # We also let CMake find the toolchain via the env var automatically.
-      - name: Configure CMake
-        run: |
-          NDK_PATH=$(qpm ndk list 2>/dev/null | grep -oP '/[^\s]+' | head -1)
-          echo "Using NDK at: $NDK_PATH"
-          cmake -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-31 \
-            -B build
+          # Fill in mod.json from template
+          cat mod.template.json \
+            | jq --arg v "$MOD_VERSION" '.version = $v' \
+            > qmod_package/mod.json
 
-      # ── 8. Compile ───────────────────────────────────────────────────────────
-      - name: Build
-        run: cmake --build ./build
+          # Copy cover art if present
+          [ -f cover.png ] && cp cover.png qmod_package/
 
-      # ── 9. Verify .so exists ─────────────────────────────────────────────────
-      - name: Verify build output
-        run: |
-          SO="build/${{ steps.mod.outputs.soname }}"
-          if [ ! -f "$SO" ]; then
-            echo "ERROR: Expected $SO — contents of build/:"
-            ls -lh build/
-            exit 1
-          fi
-          echo "Found: $SO ($(du -sh $SO | cut -f1))"
+          cd qmod_package
+          zip -r "../${MOD_ID}_v${MOD_VERSION}.qmod" .
+          cd ..
 
-      # ── 10. Update mod.json modFiles to reference our .so ────────────────────
-      # The template ships with an empty modFiles array.
-      # We inject the .so name so qpm package zip picks it up correctly.
-      - name: Inject .so into mod.json modFiles
-        run: |
-          SO_NAME="${{ steps.mod.outputs.soname }}"
-          # Copy the .so into cwd so zip can find it alongside mod.json
-          cp "build/$SO_NAME" "./$SO_NAME"
-          # Inject into modFiles array using jq
-          jq --arg so "$SO_NAME" '.modFiles += [$so]' mod.json > mod.tmp.json
-          mv mod.tmp.json mod.json
-          echo "Updated mod.json modFiles:"
-          jq '.modFiles' mod.json
-
-      # ── 11. Copy dependency .so files from extern/libs ───────────────────────
-      # Inject any libraryFiles that qpm placed in extern/libs into mod.json
-      # and copy them to cwd for packaging.
-      - name: Collect library dependencies
-        run: |
-          if [ -d "extern/libs" ]; then
-            for lib in extern/libs/*.so; do
-              [ -f "$lib" ] || continue
-              fname=$(basename "$lib")
-              cp "$lib" "./$fname"
-              jq --arg f "$fname" '.libraryFiles += [$f]' mod.json > mod.tmp.json
-              mv mod.tmp.json mod.json
-              echo "Added library: $fname"
-            done
-          fi
-
-      # ── 12. Package .qmod ────────────────────────────────────────────────────
-      # A .qmod is a ZIP: mod.json + .so files + cover image.
-      - name: Package QMOD
-        run: |
-          QMOD="${{ steps.mod.outputs.qmodname }}"
-          FILES="mod.json"
-
-          # Cover image
-          COVER=$(jq -r '.coverImage // ""' mod.json)
-          [ -n "$COVER" ] && [ -f "$COVER" ] && FILES="$FILES $COVER"
-
-          # All .so files we copied to cwd
-          for f in $(jq -r '(.modFiles // [])[], (.libraryFiles // [])[]' mod.json); do
-            [ -f "$f" ] && FILES="$FILES $f"
-          done
-
-          echo "Packaging: $FILES"
-          zip -j "$QMOD" $FILES
-          echo "Created $QMOD ($(du -sh $QMOD | cut -f1))"
-
-      # ── 13. Upload .qmod artifact ─────────────────────────────────────────────
-      - name: Upload QMOD
+      - name: Upload qmod artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.mod.outputs.qmodname }}
-          path: ${{ steps.mod.outputs.qmodname }}
+          name: slicevisualizer-qmod
+          path: "*.qmod"
           if-no-files-found: error
-
-      # ── 14. Upload debug symbols ──────────────────────────────────────────────
-      - name: Upload debug symbols
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-${{ steps.mod.outputs.soname }}
-          path: debug/
-          if-no-files-found: warn
-
-      # ── 15. GitHub Release on version tags ────────────────────────────────────
-      # Push a tag like "v5.1.0" → auto-creates a release with the .qmod attached.
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.mod.outputs.qmodname }}
-          generate_release_notes: true
