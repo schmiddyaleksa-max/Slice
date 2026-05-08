@@ -1,0 +1,167 @@
+name: Build & Package QMOD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  # Also allow manual runs from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Android NDK ─────────────────────────────────────────────────────
+      - name: Setup Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      # ── 3. Ninja build system ───────────────────────────────────────────────
+      - name: Install Ninja
+        run: sudo apt-get install -y ninja-build
+
+      # ── 4. QPM CLI ──────────────────────────────────────────────────────────
+      - name: Install QPM
+        run: |
+          curl -Lo /usr/local/bin/qpm \
+            https://github.com/QuestPackageManager/QPM.CLI/releases/latest/download/qpm-linux
+          chmod +x /usr/local/bin/qpm
+          qpm --version
+
+      # ── 5. Restore dependencies ─────────────────────────────────────────────
+      # This generates: extern/, shared/, qpm_defines.cmake, extern.cmake
+      - name: QPM Restore
+        run: qpm restore
+
+      # ── 6. Read mod metadata from qpm.json ──────────────────────────────────
+      - name: Read mod metadata
+        id: mod
+        run: |
+          MOD_ID=$(jq -r '.info.id' qpm.json)
+          MOD_VERSION=$(jq -r '.info.version' qpm.json)
+          echo "id=$MOD_ID"           >> $GITHUB_OUTPUT
+          echo "version=$MOD_VERSION" >> $GITHUB_OUTPUT
+          echo "soname=lib${MOD_ID}.so" >> $GITHUB_OUTPUT
+          echo "qmodname=${MOD_ID}_v${MOD_VERSION}.qmod" >> $GITHUB_OUTPUT
+
+      # ── 7. Generate mod.json from template ──────────────────────────────────
+      - name: Generate mod.json
+        run: |
+          MOD_ID="${{ steps.mod.outputs.id }}"
+          MOD_VERSION="${{ steps.mod.outputs.version }}"
+          # Read the mod name from qpm.json (may differ from id)
+          MOD_NAME=$(jq -r '.info.name' qpm.json)
+
+          sed \
+            -e "s/\${mod_name}/$MOD_NAME/g" \
+            -e "s/\${mod_id}/$MOD_ID/g" \
+            -e "s/\${version}/$MOD_VERSION/g" \
+            mod.template.json > mod.json
+
+          echo "Generated mod.json:"
+          cat mod.json
+
+      # ── 8. CMake configure ──────────────────────────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-31 \
+            -B build
+
+      # ── 9. Compile ──────────────────────────────────────────────────────────
+      - name: Build
+        run: cmake --build ./build
+
+      # ── 10. Verify .so exists ───────────────────────────────────────────────
+      - name: Verify build output
+        run: |
+          SO="build/${{ steps.mod.outputs.soname }}"
+          if [ ! -f "$SO" ]; then
+            echo "ERROR: Expected $SO not found. Build output:"
+            ls -lh build/
+            exit 1
+          fi
+          echo "Found: $SO ($(du -sh $SO | cut -f1))"
+
+      # ── 11. Package .qmod ───────────────────────────────────────────────────
+      # A .qmod is just a ZIP containing mod.json, the .so, and cover.png.
+      # Library files listed in mod.json under libraryFiles are also included
+      # from build/ or extern/libs/ (matching createqmod.ps1 logic).
+      - name: Package QMOD
+        run: |
+          QMOD="${{ steps.mod.outputs.qmodname }}"
+          SO="build/${{ steps.mod.outputs.soname }}"
+          FILES="mod.json $SO"
+
+          # Include cover image if present
+          COVER=$(jq -r '.coverImage // ""' mod.json)
+          if [ -n "$COVER" ] && [ -f "$COVER" ]; then
+            FILES="$FILES $COVER"
+          fi
+
+          # Include any extra modFiles declared in mod.json
+          MOD_FILES=$(jq -r '.modFiles[]?' mod.json)
+          for f in $MOD_FILES; do
+            if [ -f "build/$f" ]; then
+              FILES="$FILES build/$f"
+            elif [ -f "extern/libs/$f" ]; then
+              FILES="$FILES extern/libs/$f"
+            else
+              echo "ERROR: modFile '$f' not found in build/ or extern/libs/"
+              exit 1
+            fi
+          done
+
+          # Include any libraryFiles declared in mod.json
+          LIB_FILES=$(jq -r '.libraryFiles[]?' mod.json)
+          for f in $LIB_FILES; do
+            if [ -f "build/$f" ]; then
+              FILES="$FILES build/$f"
+            elif [ -f "extern/libs/$f" ]; then
+              FILES="$FILES extern/libs/$f"
+            else
+              echo "ERROR: libraryFile '$f' not found in build/ or extern/libs/"
+              exit 1
+            fi
+          done
+
+          echo "Packaging: $FILES"
+          zip -j "$QMOD" $FILES
+          echo "Created: $QMOD ($(du -sh $QMOD | cut -f1))"
+
+      # ── 12. Upload .qmod as workflow artifact ───────────────────────────────
+      - name: Upload QMOD
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.mod.outputs.qmodname }}
+          path: ${{ steps.mod.outputs.qmodname }}
+          if-no-files-found: error
+
+      # ── 13. Upload debug .so separately ─────────────────────────────────────
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ steps.mod.outputs.soname }}
+          path: debug/
+          if-no-files-found: warn
+
+      # ── 14. Create GitHub Release on version tags ────────────────────────────
+      # Push a tag like "v5.1.0" to trigger a release with the .qmod attached.
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.mod.outputs.qmodname }}
+          generate_release_notes: true
